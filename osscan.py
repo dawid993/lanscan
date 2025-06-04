@@ -1,6 +1,11 @@
-from scapy.all import IP, TCP, sr1, RandShort, RandInt
+import random
+import threading
+import time
+from scapy.all import IP, TCP, send, RandShort, RandInt, sniff
 from math import gcd
 from functools import reduce
+from datetime import datetime
+import copy
 
 # Here we have our tcp probes we sent agains machine
 tcp_probes = [
@@ -85,33 +90,69 @@ tcp_probes = [
 ]
 
 
+def init_sport(tcp_probes: list):
+    first_sport = random.randint(2 * 10, 2**16 - 2**10)
+    last_sport = first_sport
+    for tcp_prob in tcp_probes:
+        tcp_prob.sport = last_sport
+        last_sport += random.randint(2**4, 2**6)
+    return tcp_probes
+
+
 def scan_os(dst_ip):
     if not dst_ip:
         return None
 
     ip = IP(dst=dst_ip)
-    tcp_res = []
+    tcp_responses = []
+    seq_rates = []
 
-    for tcp_pck in tcp_probes:
-        tcp_res.append(sr1(ip / tcp_pck, timeout=0.1))
-
+    pck_sent_time = {}
     diff1 = []
 
-    for i in range(1, len(tcp_probes)):
-        tcp_probe = tcp_res[i][TCP]
-        prev_tcp_probe = tcp_res[i - 1][TCP]
-        # print(tcp_probe.seq, prev_tcp_probe.seq)
-        if prev_tcp_probe.seq > tcp_probe.seq:
+    loc_tcp_probes = init_sport([copy.deepcopy(tcp_prob) for tcp_prob in tcp_probes])
+
+    def sniff_responses():
+        nonlocal tcp_responses
+        tcp_responses = sniff(filter=f"tcp and src host {dst_ip}", timeout=3)
+
+    sniffer_thread = threading.Thread(target=sniff_responses)
+    sniffer_thread.start()
+
+    for tcp_res in loc_tcp_probes:
+        send(ip / tcp_res, verbose=False)
+        time.sleep(0.1)
+        pck_sent_time[tcp_res.sport] = datetime.now()
+
+    sniffer_thread.join()
+
+    tcp_responses = sorted(tcp_responses, key=lambda tcp_res: tcp_res.dport)
+
+    print(pck_sent_time)
+    for pkt in tcp_responses:
+        print(f"{pkt[TCP]} {pkt[TCP].dport}")
+
+    for i in range(1, len(tcp_responses)):
+        tcp_res = tcp_responses[i][TCP]
+        prev_tcp_res = tcp_responses[i - 1][TCP]
+        if prev_tcp_res.seq > tcp_res.seq:
             diff1.append(
                 min(
-                    prev_tcp_probe.seq - tcp_probe.seq,
-                    (tcp_probe.seq + (2**32 - prev_tcp_probe.seq)),
+                    prev_tcp_res.seq - tcp_res.seq,
+                    (tcp_res.seq + (2**32 - prev_tcp_res.seq)),
                 )
             )
         else:
-            diff1.append(tcp_probe.seq - prev_tcp_probe.seq)
+            diff1.append(tcp_res.seq - prev_tcp_res.seq)
+
+        sent_diff = (
+            pck_sent_time[tcp_res.dport] - pck_sent_time[prev_tcp_res.dport]
+        ).total_seconds()
+        print(sent_diff)
+        seq_rates.append(diff1[i - 1] / sent_diff)
 
     print(diff1)
+    print(seq_rates)
     print(reduce(gcd, diff1))
 
 
