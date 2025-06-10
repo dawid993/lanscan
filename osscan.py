@@ -3,14 +3,14 @@ import random
 import statistics
 import threading
 import time
-from scapy.all import IP, TCP, send, RandShort, RandInt, sniff
+from scapy.all import IP, TCP, send, RandShort, RandInt, sniff, ICMP, Raw, sr1
 from math import gcd
 from functools import reduce
 from datetime import datetime
 import copy
 
 # Here we have our tcp probes we sent agains machine
-tcp_probes = [
+seq_gen_tcp_probes = [
     TCP(
         sport=RandShort(),
         dport=80,
@@ -91,7 +91,13 @@ tcp_probes = [
     ),
 ]
 
+icmp_probes = [
+    IP(flags="DF", tos=0) / ICMP(type=8, code=9, seq=295) / Raw(load=bytes([0x00] * 120)),
+    IP(flags="DF", tos=4) / ICMP(type=8, code=0, seq=295) / Raw(load=bytes([0x00] * 150)),
+]
+
 _DEBUG_ENABLED = True
+
 
 # In order to track tcp probes we relay on source ports
 # We choose port between 1024 and 64512 and increment after each loop by 32 up to 64
@@ -104,20 +110,52 @@ def init_sport(tcp_probes: list):
     return tcp_probes
 
 
+def init_icmp_probes(icmp_probes: list, dst_ip):
+    loc_icmp_probes = [copy.deepcopy(icmp_probe) for icmp_probe in icmp_probes]
+    if len(loc_icmp_probes) < 2:
+        raise ValueError("Should be 2 icmp probes")
+    
+    ip_id = RandShort()
+    icmp_id = RandShort()
+
+    loc_icmp_probes[0][IP].dst = dst_ip
+    loc_icmp_probes[0][IP].id = ip_id
+    loc_icmp_probes[0][ICMP].id = icmp_id
+    
+    loc_icmp_probes[1][IP].dst = dst_ip
+    loc_icmp_probes[1][ICMP].id = icmp_id + 1
+    loc_icmp_probes[1][ICMP].seq = loc_icmp_probes[0][ICMP].seq + 1
+
+    return loc_icmp_probes
+
+
 def scan_os(dst_ip):
     if not dst_ip:
         return None
 
-    ip = IP(dst=dst_ip)
-    tcp_responses = []
+    ip = IP(dst=dst_ip)      
+
+    tcp_responses, pck_sent_time = run_tcp_seq_probes(seq_gen_tcp_probes, dst_ip, ip)  
+    diff1, seq_rates = calc_diff_and_seq_rates(tcp_responses, pck_sent_time)
+    
+    icmp_responses = run_icmp_probes(icmp_probes, dst_ip)
+
+    if _DEBUG_ENABLED:
+        log_tcp_responses(tcp_responses, pck_sent_time)
+        log_final_results(seq_rates, diff1)
+        print(icmp_responses)
+        
+    gcd = calc_gcd(diff1)
+    return gcd, calc_isr(seq_rates), calc_sp(seq_rates, gcd)
+
+def run_tcp_seq_probes(tcp_probes, dst_ip, ip):
     pck_sent_time = {}
+    tcp_responses = []
 
-    seq_rates = []
-    diff1 = []
-
-    # If we need tcp_probes later want to assert we have clean copy
-    loc_tcp_probes = init_sport([copy.deepcopy(tcp_prob) for tcp_prob in tcp_probes])
-
+    loc_tcp_probes = init_sport(
+        [copy.deepcopy(tcp_prob) for tcp_prob in tcp_probes]
+    )
+    
     def sniff_responses():
         nonlocal tcp_responses
         tcp_responses = sniff(filter=f"tcp and src host {dst_ip}", timeout=3)
@@ -134,9 +172,12 @@ def scan_os(dst_ip):
 
     tcp_responses = sorted(tcp_responses, key=lambda tcp_res: tcp_res.dport)
     
-    if _DEBUG_ENABLED:
-        log_tcp_responses(tcp_responses, pck_sent_time)
+    return tcp_responses, pck_sent_time
 
+def calc_diff_and_seq_rates(tcp_responses, pck_sent_time):
+    seq_rates = []
+    diff1 = []
+    
     for tcp_res, prev_tcp_res in zip(tcp_responses[1:], tcp_responses):
         dif1_v = (
             calc_min_diff(tcp_res[TCP], prev_tcp_res[TCP])
@@ -146,13 +187,20 @@ def scan_os(dst_ip):
         sent_diff = calc_time_diff(pck_sent_time, tcp_res, prev_tcp_res)
         seq_rates.append(dif1_v / sent_diff)
         diff1.append(dif1_v)
+    
+    return diff1, seq_rates
 
-    if _DEBUG_ENABLED:
-        log_final_results(seq_rates, diff1)
-    
-    gcd = calc_gcd(diff1)
-    return gcd, calc_isr(seq_rates),calc_sp(seq_rates, gcd)
-    
+def run_icmp_probes(icmp_probes, dst_ip):
+    icmp_responses = []
+    loc_icmp_probes = init_icmp_probes(
+        [copy.deepcopy(tcp_prob) for tcp_prob in icmp_probes], dst_ip
+    )    
+        
+    for icmp_probe in loc_icmp_probes:
+        icmp_responses.append(sr1(icmp_probe, timeout=2))
+        
+    return icmp_responses
+
 
 def log_final_results(seq_rates, diff1):
     print(diff1)
@@ -199,7 +247,7 @@ def calc_sp(seq_rates, gcd):
 
 
 def main():
-    print(scan_os("192.168.55.1"))
+    print(scan_os("192.168.50.1"))
 
 
 if __name__ == "__main__":
